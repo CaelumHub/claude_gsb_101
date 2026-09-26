@@ -270,12 +270,9 @@ class ApiRouter:
 
         # --- community ---
         if route == "/community" and method == "GET":
-            if config.COMMUNITY_READ_DIRECT:
-                data = self.service.derived.load_community()
-                data.setdefault("communities", {})
-                data.setdefault("num_communities", 0)
-                data.setdefault("modularity", 0.0)
-                return 200, data
+            # Always go through the service: it transparently recomputes the
+            # partition when the graph changed (e.g. after an edge import),
+            # so a page refresh can never serve a stale community.json.
             return 200, self.service.get_community()
         if route == "/community/compute" and method == "POST":
             resolution = _to_float((body or {}).get("resolution"), config.LOUVAIN_RESOLUTION)
@@ -475,6 +472,9 @@ class SocialGraphHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        # Derived data (community/statistics) must always be revalidated,
+        # otherwise the browser can serve a pre-import partition from cache.
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(data)
 

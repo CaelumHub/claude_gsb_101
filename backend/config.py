@@ -85,8 +85,6 @@ LOUVAIN_MAX_ITER = 50
 LOUVAIN_MIN_IMPROVEMENT = 1e-9
 LOUVAIN_RANDOM_SEED = 1337
 
-COMMUNITY_READ_DIRECT = True
-
 BFS_MAX_DEPTH = 64                        # safety bound on unweighted BFS
 
 # Recommendation
