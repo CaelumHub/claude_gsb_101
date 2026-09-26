@@ -89,10 +89,20 @@ class SocialGraphService:
             return self._graph
 
     def invalidate_graph(self) -> None:
+        """Mark the cached graph and all graph-derived results as stale.
+
+        Called after every structural mutation (edge import, user deletion,
+        shard rebuild).  Derived caches (community / pagerank) are dropped and
+        flagged dirty so the next read recomputes them against the new graph;
+        we must *not* leave their dirty flags clear, otherwise readers would
+        keep serving pre-mutation results forever.
+        """
         with self._lock:
             self._graph = None
             self._graph_dirty = True
-            self._community_dirty = False
+            self._community_cache = None
+            self._community_dirty = True
+            self._pagerank_cache = None
             self._pagerank_dirty = True
 
     def graph_stats(self) -> dict:
@@ -350,15 +360,43 @@ class SocialGraphService:
     # Community / pagerank (cached)
     # ------------------------------------------------------------------
     def compute_community(self, resolution: Optional[float] = None, force: bool = False) -> dict:
+        with self._lock:
+            res = resolution if resolution is not None else config.LOUVAIN_RESOLUTION
+            if (
+                not force
+                and self._community_cache is not None
+                and not self._community_dirty
+            ):
+                return self._community_cache
+            return self._recompute_community(res)
+
+    def _recompute_community(self, res: float) -> dict:
+        """Run Louvain on the current graph and refresh both caches.
+
+        Must be called with ``self._lock`` held.  The result is kept in memory
+        *and* persisted to ``community.json``: graph/community pages read
+        through the service cache, while the on-disk copy keeps disk and memory
+        consistent across restarts.
+        """
         graph = self.get_graph()
-        res = config.LOUVAIN_RESOLUTION
         with config.Timed() as timer:
             result = louvain(graph, resolution=res)
+        # Normalise the node -> community map to int node ids.  louvain() may
+        # emit string keys (config.COMMUNITY_KEY_TYPE == "str"), but every
+        # consumer in the service/API layers looks nodes up by int id; mixing
+        # the two silently turns every lookup into -1 ("no colour").
+        communities = {
+            int(node): int(comm) for node, comm in result["communities"].items()
+        }
+        result["communities"] = communities
+        result["num_communities"] = len(set(communities.values())) or result.get(
+            "num_communities", 0
+        )
         result["resolution"] = res
         result["time_ms"] = round(timer.elapsed_ms, 2)
         result["computed_at"] = config.now_ms()
         members: Dict[int, List[int]] = defaultdict(list)
-        for node, comm in result["communities"].items():
+        for node, comm in communities.items():
             members[comm].append(node)
         result["community_sizes"] = [
             {"community": c, "size": len(nodes)}
@@ -368,27 +406,41 @@ class SocialGraphService:
         for c, nodes in members.items():
             result["members"][str(c)] = [str(n) for n in sorted(nodes)]
         result["member_count"] = sum(len(nodes) for nodes in members.values())
-        result["community_map"] = {}
-        for node, comm in result["communities"].items():
-            result["community_map"][str(node)] = int(comm)
+        result["community_map"] = {
+            str(node): int(comm) for node, comm in communities.items()
+        }
         self._community_cache = result
-        self._community_dirty = True
+        self._community_dirty = False
+        self.derived.save_community(result)
         return result
 
     def get_community(self) -> dict:
-        if self._community_dirty:
-            self._community_dirty = False
-        if self._community_cache is not None:
-            return self._community_cache
-        cached = self.derived.load_community()
-        if cached.get("communities") or cached.get("num_communities", 0) > 0:
-            return cached
-        return {
-            "communities": {},
-            "num_communities": 0,
-            "modularity": 0.0,
-            "computed_at": 0,
-        }
+        """Return the community partition for the current graph.
+
+        When the graph has changed since the last computation (import / delete
+        / rebuild), the cached result is stale: transparently recompute and
+        persist it here so every page -- community discovery, graph colouring,
+        the stats panel -- reflects the latest graph without a manual refresh.
+        """
+        with self._lock:
+            if not self._community_dirty and self._community_cache is not None:
+                return self._community_cache
+            if not self._community_dirty:
+                # First access in this process: reuse the on-disk result if one
+                # has ever been computed.
+                cached = self.derived.load_community()
+                if cached.get("communities") or cached.get("num_communities", 0) > 0:
+                    cached["communities"] = {
+                        int(node): int(comm)
+                        for node, comm in cached.get("communities", {}).items()
+                    }
+                    self._community_cache = cached
+                    return cached
+                # Never computed before -- compute now rather than returning an
+                # empty placeholder the UI would display indefinitely.
+                return self._recompute_community(config.LOUVAIN_RESOLUTION)
+            # Graph mutated since the last result -> recompute for the new graph.
+            return self._recompute_community(config.LOUVAIN_RESOLUTION)
 
     def _community_of(self, uid: int) -> int:
         comm = self.get_community()

@@ -270,12 +270,10 @@ class ApiRouter:
 
         # --- community ---
         if route == "/community" and method == "GET":
-            if config.COMMUNITY_READ_DIRECT:
-                data = self.service.derived.load_community()
-                data.setdefault("communities", {})
-                data.setdefault("num_communities", 0)
-                data.setdefault("modularity", 0.0)
-                return 200, data
+            # Always go through the service: it tracks graph mutations and
+            # recomputes/persists when the on-disk partition is stale.  Reading
+            # community.json directly here would bypass invalidation and keep
+            # serving the pre-import partition no matter how the graph changes.
             return 200, self.service.get_community()
         if route == "/community/compute" and method == "POST":
             resolution = _to_float((body or {}).get("resolution"), config.LOUVAIN_RESOLUTION)
